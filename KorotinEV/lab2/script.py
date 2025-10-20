@@ -13,329 +13,316 @@ from tensorflow.keras import layers, models
 from tensorflow.keras.applications import VGG16
 from tensorflow.keras.optimizers import Adam
 
-class LandmarkClassifier:
-    def __init__(self, n_clusters=100, algorithm='bow', image_size=(224, 224)):
-        self.n_clusters = n_clusters
-        self.algorithm = algorithm
-        self.image_size = image_size
-        self.kmeans = None
-        self.svm = None
-        self.scaler = StandardScaler()
-        self.sift = cv2.SIFT_create()
-        self.model = None
+# Глобальные переменные
+CLASS_NAMES = ['Архангельский собор', 'Дворец труда', 'Нижегородский Кремль']
+LABEL_TO_ID = {name: i for i, name in enumerate(CLASS_NAMES)}
+
+# Инициализация объектов
+sift = cv2.SIFT_create()
+kmeans = None
+svm = None
+scaler = StandardScaler()
+model = None
+algorithm = 'bow'
+image_size = (224, 224)
+n_clusters = 100
+
+def extract_features(image_path):
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"Ошибка загрузки изображения: {image_path}")
+        return None
         
-        self.class_names = ['Архангельский собор', 'Дворец труда', 'Нижегородский Кремль']
-        self.label_to_id = {name: i for i, name in enumerate(self.class_names)}
-        
-    def extract_features(self, image_path):
-        image = cv2.imread(image_path)
-        if image is None:
-            print(f"Ошибка загрузки изображения: {image_path}")
-            return None
-            
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        keypoints, descriptors = self.sift.detectAndCompute(gray, None)
-        return descriptors
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    keypoints, descriptors = sift.detectAndCompute(gray, None)
+    return descriptors
+
+def build_vocabulary(all_descriptors):
+    global kmeans
+    all_descriptors = np.vstack(all_descriptors)
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    kmeans.fit(all_descriptors)
     
-    def build_vocabulary(self, all_descriptors):
-        all_descriptors = np.vstack(all_descriptors)
+    return kmeans
 
-        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        self.kmeans.fit(all_descriptors)
-        
-        return self.kmeans
+def descr_to_histogram(descriptors):
+    labels = kmeans.predict(descriptors)
     
-    def descr_to_histogram(self, descriptors):
-        labels = self.kmeans.predict(descriptors)
-        
-        histogram, _ = np.histogram(labels, bins=self.n_clusters, range=(0, self.n_clusters))
-        
-        histogram = histogram.astype(float)
-        if np.sum(histogram) > 0:
-            histogram /= np.sum(histogram)
-            
-        return histogram
-
+    histogram, _ = np.histogram(labels, bins=n_clusters, range=(0, n_clusters))
     
-    def train_bow(self, train_paths, train_labels):
-        all_descriptors = []
+    histogram = histogram.astype(float)
+    if np.sum(histogram) > 0:
+        histogram /= np.sum(histogram)
         
-        for image_path in train_paths:
-            descriptors = self.extract_features(image_path)
-            if descriptors is not None:
-                all_descriptors.append(descriptors)
-        
-        self.build_vocabulary(all_descriptors)
- 
-        train_features = []
-        for descriptors in all_descriptors:
-            histogram = self.descr_to_histogram(descriptors)
-            train_features.append(histogram)
-        
-        train_features = np.array(train_features)     
-        train_features_scaled = self.scaler.fit_transform(train_features)
+    return histogram
 
-        self.svm = SVC(kernel='linear', probability=True, random_state=42)
-        self.svm.fit(train_features_scaled, train_labels)
+def train_bow(train_paths, train_labels):
+    global svm, scaler
+    
+    all_descriptors = []
+    
+    for image_path in train_paths:
+        descriptors = extract_features(image_path)
+        if descriptors is not None:
+            all_descriptors.append(descriptors)
+    
+    build_vocabulary(all_descriptors)
 
-        train_predictions = self.svm.predict(train_features_scaled)
-        train_tpr = recall_score(train_labels, train_predictions, average="weighted")
-        
-        return train_tpr
+    train_features = []
+    for descriptors in all_descriptors:
+        histogram = descr_to_histogram(descriptors)
+        train_features.append(histogram)
+    
+    train_features = np.array(train_features)     
+    train_features_scaled = scaler.fit_transform(train_features)
 
+    svm = SVC(kernel='linear', probability=True, random_state=42)
+    svm.fit(train_features_scaled, train_labels)
 
+    train_predictions = svm.predict(train_features_scaled)
+    train_tpr = recall_score(train_labels, train_predictions, average="weighted")
+    
+    return train_tpr
 
-    def test_bow(self, test_paths, test_labels):
-        test_features = []
-        
-        for path in test_paths:
-            histogram = self.descr_to_histogram(self.extract_features(path))
-            test_features.append(histogram)
-        
-        test_features = np.array(test_features)
-        test_features_scaled = self.scaler.transform(test_features)
-        
-        test_predictions = self.svm.predict(test_features_scaled)
-        test_tpr = recall_score(test_labels, test_predictions, average="weighted")
-        
-        return test_tpr, test_predictions
+def test_bow(test_paths, test_labels):
+    test_features = []
+    
+    for path in test_paths:
+        histogram = descr_to_histogram(extract_features(path))
+        test_features.append(histogram)
+    
+    test_features = np.array(test_features)
+    test_features_scaled = scaler.transform(test_features)
+    
+    test_predictions = svm.predict(test_features_scaled)
+    test_tpr = recall_score(test_labels, test_predictions, average="weighted")
+    
+    return test_tpr, test_predictions
 
-
-
-    def create_cnn_model(self):
-        base_model = VGG16(weights='imagenet', 
-                          include_top=False, 
-                          input_shape=(self.image_size[0], self.image_size[1], 3))
-        
-        base_model.trainable = False
-        
-        model = models.Sequential([
-            base_model,
-            layers.GlobalAveragePooling2D(),
-            layers.Dropout(0.5),
-            layers.Dense(256, activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.5),
-            layers.Dense(3, activation='softmax')
-        ])
-        
-        model.compile(optimizer=Adam(learning_rate=0.001),
+def create_cnn_model():
+    base_model = VGG16(weights='imagenet', 
+                      include_top=False, 
+                      input_shape=(image_size[0], image_size[1], 3))
+    
+    base_model.trainable = False
+    
+    cnn_model = models.Sequential([
+        base_model,
+        layers.GlobalAveragePooling2D(),
+        layers.Dropout(0.5),
+        layers.Dense(256, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.5),
+        layers.Dense(3, activation='softmax')
+    ])
+    
+    cnn_model.compile(optimizer=Adam(learning_rate=0.001),
                      loss='sparse_categorical_crossentropy',
                      metrics=['accuracy'])
-        
-        return model
-
-
     
-    def preprocess_image_cnn(self, image_path):
-        image = cv2.imread(image_path)
-        if image is None:
-            return None
-            
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, self.image_size)
-        image = image.astype('float32') / 255.0
-        
-        return image
+    return cnn_model
 
+def preprocess_image_cnn(image_path):
+    image = cv2.imread(image_path)
+    if image is None:
+        return None
+        
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = cv2.resize(image, image_size)
+    image = image.astype('float32') / 255.0
+    
+    return image
 
+def train_cnn(train_paths, train_labels, label_ids):
+    global model
+    
+    X_train = []
+    y_train = []
+    
+    for (path, label_id) in zip(train_paths, label_ids):
+        image = preprocess_image_cnn(path)
+        if image is not None:
+            X_train.append(image)
+            y_train.append(label_id)
+    
+    X_train = np.array(X_train)
+    y_train = np.array(y_train)
+    
+    model = create_cnn_model()
+    
+    history = model.fit(
+        X_train, y_train,
+        batch_size=16,
+        epochs=5
+    )
+    
+    train_predictions = np.argmax(model.predict(X_train), axis=1)
+    train_tpr = recall_score(y_train, train_predictions, average="weighted")
+    
+    return train_tpr
 
-    def train_cnn(self, train_paths, train_labels, label_ids):
-        X_train = []
-        y_train = []
-        
-        for (path, label_id) in zip(train_paths, label_ids):
-            image = self.preprocess_image_cnn(path)
-            if image is not None:
-                X_train.append(image)
-                y_train.append(label_id)
-        
-        X_train = np.array(X_train)
-        y_train = np.array(y_train)
-        
-        self.model = self.create_cnn_model()
-        
-        history = self.model.fit(
-            X_train, y_train,
-            batch_size=16,
-            epochs=5
-        )
-        
-        train_predictions = np.argmax(self.model.predict(X_train), axis=1)
-        train_tpr = recall_score(y_train, train_predictions, average="weighted")
-        
-        return train_tpr
+def test_cnn(test_paths, test_labels, label_ids):
+    X_test = []
+    y_test = []
+    
+    for (path, label_id) in zip(test_paths, label_ids):
+        image = preprocess_image_cnn(path)
+        if image is not None:
+            X_test.append(image)
+            y_test.append(label_id)
+    
+    X_test = np.array(X_test)
+    y_test = np.array(y_test)
+    
+    test_predictions_proba = model.predict(X_test)
+    test_predictions = np.argmax(test_predictions_proba, axis=1)
+    test_tpr = recall_score(y_test, test_predictions, average="weighted")
+    
+    test_predictions_labels = [CLASS_NAMES[pred] for pred in test_predictions]
+    
+    return test_tpr, test_predictions_labels
 
+def detect_label_from_path(file_path):
+    if '01_NizhnyNovgorodKremlin' in file_path:
+        return 'Нижегородский Кремль'
+    elif '08_PalaceOfLabor' in file_path:
+        return 'Дворец труда'
+    elif '04_ArkhangelskCathedral' in file_path:
+        return 'Архангельский собор'
+    else:
+        print(f"Не удалось определить метку для файла: {file_path}")
+        return None
 
-
-    def test_cnn(self, test_paths, test_labels, label_ids):
-        X_test = []
-        y_test = []
+def load_data(file_list_path, images_dir="."):
+    with open(file_list_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    
+    image_paths = []
+    labels = []
+    label_ids = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
         
-        for (path, label_id) in zip(test_paths, label_ids):
-            image = self.preprocess_image_cnn(path)
-            if image is not None:
-                X_test.append(image)
-                y_test.append(label_id)
+        full_path = os.path.join(images_dir, line)
         
-        X_test = np.array(X_test)
-        y_test = np.array(y_test)
-        
-        test_predictions_proba = self.model.predict(X_test)
-        test_predictions = np.argmax(test_predictions_proba, axis=1)
-        test_tpr = recall_score(y_test, test_predictions, average="weighted")
-        
-        test_predictions_labels = [self.class_names[pred] for pred in test_predictions]
-        
-        return test_tpr, test_predictions_labels
-
-
-
-    def train(self, train_file, images_dir="."):
-        train_paths, train_labels, label_ids = self.load_data(train_file, images_dir)
-        
-        if len(train_paths) == 0:
-            print("Ошибка: нет данных для обучения!")
-            return 0
-        
-        if self.algorithm == 'bow':
-            train_tpr = self.train_bow(train_paths, train_labels)
-        elif self.algorithm == 'cnn':
-            train_tpr = self.train_cnn(train_paths, train_labels, label_ids)
-        else:
-            print(f"Неизвестный алгоритм: {self.algorithm}")
-            return 0
-        
-        print(f"Точность на обучающей выборке: {train_tpr:.4f}")
-        return train_tpr
-
-
-
-    def test(self, test_file, images_dir="."):
-        test_paths, test_labels, label_ids = self.load_data(test_file, images_dir)
-        
-        if len(test_paths) == 0:
-            print("Ошибка: нет данных для тестирования!")
-            return 0
-        
-        if self.algorithm == 'bow':
-            test_tpr, test_predictions = self.test_bow(test_paths, test_labels)
-        elif self.algorithm == 'cnn':
-            test_tpr, test_predictions = self.test_cnn(test_paths, test_labels, label_ids)
-        else:
-            print(f"Неизвестный алгоритм: {self.algorithm}")
-            return 0
-        
-        print(f"Точность на тестовой выборке: {test_tpr:.4f}")
-        
-        print("\nДетальный отчет по классификации:")
-        print(classification_report(test_labels, test_predictions))
-        
-        return test_tpr
-
-
-
-    def detect_label_from_path(self, file_path):
-        
-        if '01_NizhnyNovgorodKremlin' in file_path:
-            return 'Нижегородский Кремль'
-        elif '08_PalaceOfLabor' in file_path:
-            return 'Дворец труда'
-        elif '04_ArkhangelskCathedral' in file_path:
-            return 'Архангельский собор'
-        else:
-            print(f"Не удалось определить метку для файла: {file_path}")
-            return None
-
-
-
-    def load_data(self, file_list_path, images_dir="."):
-        with open(file_list_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        
-        image_paths = []
-        labels = []
-        label_ids = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            full_path = os.path.join(images_dir, line)
-            
-            if os.path.exists(full_path):
-                label = self.detect_label_from_path(full_path)
-                if label is not None:
-                    image_paths.append(full_path)
-                    labels.append(label)
-                    label_ids.append(self.label_to_id[label])
-                else:
-                    print(f"Пропущен файл (не определена метка): {full_path}")
+        if os.path.exists(full_path):
+            label = detect_label_from_path(full_path)
+            if label is not None:
+                image_paths.append(full_path)
+                labels.append(label)
+                label_ids.append(LABEL_TO_ID[label])
             else:
-                print(f"Файл не найден: {full_path}")
-        
-        print(f"Загружено {len(image_paths)} изображений")
-        print(f"Распределение по классам:")
-        for label_name in self.class_names:
-            count = labels.count(label_name)
-            print(f"  {label_name}: {count} изображений")
-        
-        return image_paths, labels, label_ids
-
+                print(f"Пропущен файл (не определена метка): {full_path}")
+        else:
+            print(f"Файл не найден: {full_path}")
     
+    print(f"Загружено {len(image_paths)} изображений")
+    print(f"Распределение по классам:")
+    for label_name in CLASS_NAMES:
+        count = labels.count(label_name)
+        print(f"  {label_name}: {count} изображений")
+    
+    return image_paths, labels, label_ids
 
-    def save_model(self, model_dir="models"):
-        os.makedirs(model_dir, exist_ok=True)
-        
-        if self.algorithm == 'bow':
-            joblib.dump(self.kmeans, os.path.join(model_dir, 'kmeans_model.pkl'))
-            joblib.dump(self.svm, os.path.join(model_dir, 'svm_model.pkl'))
-            joblib.dump(self.scaler, os.path.join(model_dir, 'scaler.pkl'))
-            
-            metadata = {
-                'algorithm': 'bow',
-                'n_clusters': self.n_clusters,
-                'class_names': self.class_names
-            }
-            
-        elif self.algorithm == 'cnn':
-            self.model.save(os.path.join(model_dir, 'cnn_model.h5'))
-            
-            metadata = {
-                'algorithm': 'cnn',
-                'image_size': self.image_size,
-                'class_names': self.class_names
-            }
-        
-        with open(os.path.join(model_dir, 'metadata.json'), 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
-        
-        print(f"Модель сохранена в директории: {model_dir}")
+def train_model(train_file, images_dir=".", alg='bow', clusters=100):
+    global algorithm, n_clusters
+    algorithm = alg
+    n_clusters = clusters
+    
+    train_paths, train_labels, label_ids = load_data(train_file, images_dir)
+    
+    if len(train_paths) == 0:
+        print("Ошибка: нет данных для обучения!")
+        return 0
+    
+    if algorithm == 'bow':
+        train_tpr = train_bow(train_paths, train_labels)
+    elif algorithm == 'cnn':
+        train_tpr = train_cnn(train_paths, train_labels, label_ids)
+    else:
+        print(f"Неизвестный алгоритм: {algorithm}")
+        return 0
+    
+    print(f"Точность на обучающей выборке: {train_tpr:.4f}")
+    return train_tpr
 
+def test_model(test_file, images_dir="."):
+    test_paths, test_labels, label_ids = load_data(test_file, images_dir)
+    
+    if len(test_paths) == 0:
+        print("Ошибка: нет данных для тестирования!")
+        return 0
+    
+    if algorithm == 'bow':
+        test_tpr, test_predictions = test_bow(test_paths, test_labels)
+    elif algorithm == 'cnn':
+        test_tpr, test_predictions = test_cnn(test_paths, test_labels, label_ids)
+    else:
+        print(f"Неизвестный алгоритм: {algorithm}")
+        return 0
+    
+    print(f"Точность на тестовой выборке: {test_tpr:.4f}")
+    
+    print("\nДетальный отчет по классификации:")
+    print(classification_report(test_labels, test_predictions))
+    
+    return test_tpr
 
+def save_model(model_dir="models"):
+    os.makedirs(model_dir, exist_ok=True)
+    
+    if algorithm == 'bow':
+        joblib.dump(kmeans, os.path.join(model_dir, 'kmeans_model.pkl'))
+        joblib.dump(svm, os.path.join(model_dir, 'svm_model.pkl'))
+        joblib.dump(scaler, os.path.join(model_dir, 'scaler.pkl'))
+        
+        metadata = {
+            'algorithm': 'bow',
+            'n_clusters': n_clusters,
+            'class_names': CLASS_NAMES
+        }
+        
+    elif algorithm == 'cnn':
+        model.save(os.path.join(model_dir, 'cnn_model.h5'))
+        
+        metadata = {
+            'algorithm': 'cnn',
+            'image_size': image_size,
+            'class_names': CLASS_NAMES
+        }
+    
+    with open(os.path.join(model_dir, 'metadata.json'), 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    
+    print(f"Модель сохранена в директории: {model_dir}")
 
-    def load_model(self, model_dir="models"):
-        with open(os.path.join(model_dir, 'metadata.json'), 'r', encoding='utf-8') as f:
-            metadata = json.load(f)
+def load_model(model_dir="models"):
+    global algorithm, CLASS_NAMES, LABEL_TO_ID, kmeans, svm, scaler, model, image_size, n_clusters
+    
+    with open(os.path.join(model_dir, 'metadata.json'), 'r', encoding='utf-8') as f:
+        metadata = json.load(f)
+    
+    algorithm = metadata['algorithm']
+    CLASS_NAMES = metadata['class_names']
+    LABEL_TO_ID = {name: i for i, name in enumerate(CLASS_NAMES)}
+    
+    if algorithm == 'bow':
+        kmeans = joblib.load(os.path.join(model_dir, 'kmeans_model.pkl'))
+        svm = joblib.load(os.path.join(model_dir, 'svm_model.pkl'))
+        scaler = joblib.load(os.path.join(model_dir, 'scaler.pkl'))
+        n_clusters = metadata['n_clusters']
         
-        self.algorithm = metadata['algorithm']
-        self.class_names = metadata['class_names']
-        self.label_to_id = {name: i for i, name in enumerate(self.class_names)}
-        
-        if self.algorithm == 'bow':
-            self.kmeans = joblib.load(os.path.join(model_dir, 'kmeans_model.pkl'))
-            self.svm = joblib.load(os.path.join(model_dir, 'svm_model.pkl'))
-            self.scaler = joblib.load(os.path.join(model_dir, 'scaler.pkl'))
-            self.n_clusters = metadata['n_clusters']
-            
-        elif self.algorithm == 'cnn':
-            self.model = tf.keras.models.load_model(os.path.join(model_dir, 'cnn_model.h5'))
-            self.image_size = tuple(metadata['image_size'])
-        
-        print(f"Модель загружена из директории: {model_dir}")
-        print(f"Алгоритм: {self.algorithm}")
-        return True
+    elif algorithm == 'cnn':
+        model = tf.keras.models.load_model(os.path.join(model_dir, 'cnn_model.h5'))
+        image_size = tuple(metadata['image_size'])
+    
+    print(f"Модель загружена из директории: {model_dir}")
+    print(f"Алгоритм: {algorithm}")
+    return True
 
 def main():
     parser = argparse.ArgumentParser(description='Классификация достопримечательностей Нижнего Новгорода')
@@ -357,8 +344,6 @@ def main():
     if args.mode in ['test', 'both'] and not args.test_file:
         parser.error("Для режима тестирования требуется указать --test_file")
     
-    classifier = LandmarkClassifier(n_clusters=args.clusters, algorithm=args.algorithm)
-    
     print(f"Режим работы: {args.mode}")
     print(f"Алгоритм: {args.algorithm}")
     print(f"Директория с данными: {args.data_dir}")
@@ -367,18 +352,18 @@ def main():
     test_tpr = 0
     
     if args.mode in ['train', 'both']:
-        train_tpr = classifier.train(args.train_file, args.data_dir)
+        train_tpr = train_model(args.train_file, args.data_dir, args.algorithm, args.clusters)
         
-        classifier.save_model(args.model_dir)
+        save_model(args.model_dir)
     
     if args.mode in ['test', 'both']:
         if args.mode == 'test':
             if not os.path.exists(args.model_dir):
                 print(f"Ошибка: директория с моделью {args.model_dir} не существует!")
                 return
-            classifier.load_model(args.model_dir)
+            load_model(args.model_dir)
         
-        test_tpr = classifier.test(args.test_file, args.data_dir)
+        test_tpr = test_model(args.test_file, args.data_dir)
     
     print("\n" + "="*50)
     print("РЕЗУЛЬТАТЫ:")
